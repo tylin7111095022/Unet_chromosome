@@ -78,6 +78,34 @@ class ConcatModel(nn.Module):
         middle = self.nest_unet(x)
         out = self.resunet(middle)
         return out
+    
+def cross_entropy_2d(predict, target):
+    """
+    Args:
+        predict:(n, c, h, w)
+        target:(n, 1, h, w) or (n, h, w)
+    """
+    target = target.long()
+    if target.dim() == 4:
+        target = target[:,0,:,:]
+    assert not target.requires_grad
+    assert predict.dim() == 4
+    assert predict.size(0) == target.size(0), f"{predict.size(0)} vs {target.size(0)}"
+    assert predict.size(2) == target.size(1), f"{predict.size(2)} vs {target.size(1)}"
+    assert predict.size(3) == target.size(2), f"{predict.size(3)} vs {target.size(3)}"
+    
+    n, c, h, w = predict.size()
+    target_mask = (target >= 0) * (target != 255)
+    # print(f" target_mask shape: {target_mask.shape}") #(B,H,W)
+    # print(target_mask)
+    target = target[target_mask]
+    # print(f" label shape: {target.shape}")
+    if not target.data.dim():
+        return torch.zeros(1)
+    predict = predict.transpose(1, 2).transpose(2, 3).contiguous() # (n,c,h,w) -> (n,h,w,c)
+    predict = predict[target_mask.view(n, h, w, 1).repeat(1, 1, 1, c)].view(-1, c)
+    loss = F.cross_entropy(predict, target, size_average=True)
+    return loss
 
     
 if __name__ == '__main__':

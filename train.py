@@ -9,36 +9,30 @@ import cv2
 import warnings
 warnings.filterwarnings("ignore")
 
-#online
-from model.other_network import R2U_Net,NestedUNet
 #custom module
-from metric import iou, compute_mIoU
-from model.unet_model import UNet
-from dataset import GrayDataset,RGBDataset
+from metric import compute_mIoU
+from models import get_models
+from dataset import GrayDataset
 
-dir_img = '.\\dataset\\zong\\train2017' #訓練集的圖片所在路徑
-dir_truth = '.\\dataset\\zong\\train_mask' #訓練集的真實label所在路徑
+dir_img = r'dataset\zong\val2017' #訓練集的圖片所在路徑
+dir_truth = r'dataset\zong\val_mask' #訓練集的真實label所在路徑
 dir_checkpoint = '.\\' #儲存模型的權重檔所在路徑
-dir_predict = './dataset/validation_predict' #驗證過程中儲存模型預測的predict mask
 
 def get_args():
     parser = argparse.ArgumentParser(description = 'Train the UNet on images and target masks')
-    parser.add_argument('--image_channel','-i',type=int, default=3,dest='in_channel',help="channels of input images")
+    parser.add_argument('--image_channel','-i',type=int, default=1,dest='in_channel',help="channels of input images")
     parser.add_argument('--epoch','-e',type=int,default=50,metavar='E',help='times of training model')
-    parser.add_argument('--batch','-b',type=int,metavar='B',dest='batch_size',default=1, help='Batch size')
-    parser.add_argument('--classes','-c',type=int,default=1,help='Number of classes')
-    parser.add_argument('--load', '-l', action='store_true', default=False, help='Load model from a .pth file')
-    parser.add_argument('--rate_of_learning','-r',type = float, dest='lr', default=1e-2,help='learning rate of model')
-    parser.add_argument('--no_save_pic','-n',action='store_false',default=True,dest='no_save',help='don\'t save the validation picture during the training.')
-    parser.add_argument('--log_name', type=str,default='./log.txt',help='filename of log')
+    parser.add_argument('--batch','-b',type=int,dest='batch_size',default=1, help='Batch size')
+    parser.add_argument('--classes','-c',type=int,default=2,help='Number of classes')
+    parser.add_argument('--lr','-r',type = float, default=2e-2,help='initial learning rate of model')
     parser.add_argument('--device', type=str,default='cuda:0',help='training on cpu or gpu')
+    parser.add_argument('--model', type=str,default='bn_unet',help='models, option: bn_unet, in_unet')
 
     return parser.parse_args()
 
 def main():
     args = get_args()
-    trainingDataset = RGBDataset(img_dir = dir_img, mask_dir= dir_truth)
-
+    trainingDataset = GrayDataset(img_dir = dir_img, mask_dir= dir_truth)
     #設置 log
     # ref: https://shengyu7697.github.io/python-logging/
     logger = logging.getLogger()
@@ -48,7 +42,7 @@ def main():
     ch.setLevel(logging.INFO)
     ch.setFormatter(formatter)
 
-    fh = logging.FileHandler(args.log_name)
+    fh = logging.FileHandler(os.path.join(dir_checkpoint,"log.txt"))
     fh.setLevel(logging.INFO)
     fh.setFormatter(formatter)
 
@@ -56,27 +50,21 @@ def main():
     logger.addHandler(fh)
     ###################################################
     device = torch.device( args.device if torch.cuda.is_available() else 'cpu')
-    model = UNet(n_channels=args.in_channel,n_classes = args.classes)
+    model = get_models(model_name=args.model,args=args)
     logging.info(model)
-    
-    if args.load:
-        load_path = 'mymodel.pth'
-        model.load_state_dict(torch.load(load_path, map_location=device))
-        logging.info(f'Model loaded from {load_path}')
 
     optimizer = torch.optim.Adam(model.parameters(),lr = args.lr,betas=(0.9,0.999))
-    criterion = torch.nn.BCEWithLogitsLoss()
+    criterion = torch.nn.CrossEntropyLoss()
     ##紀錄訓練的一些參數配置
     logging.info(f'''
     =======================================
     Parameters of training:
-        model: Unet
+        model: {args.model}
         in_channel: {args.in_channel}
         output_map: {args.classes}
-        type of image: RGB
         learning rate: {args.lr}
         optimizer : Adam
-        loss function : BCEWithLogitsLoss
+        loss function : CrossEntropy
     =======================================
     ''')
     try:
@@ -88,7 +76,6 @@ def main():
                 batch_size=args.batch_size,
                 device=device,
                 save_checkpoint= True,
-                save_picture=args.no_save,
                 is_valid = True)
                 
     except KeyboardInterrupt:
@@ -106,7 +93,6 @@ def training(net,
             batch_size:int,
             device,
             save_checkpoint: bool = True,
-            save_picture : bool = True,
             is_valid: bool = True):
 
     arg_loader = dict(batch_size = batch_size, num_workers = 0)
@@ -114,7 +100,7 @@ def training(net,
         n_train = int(0.8*len(dataset))
         n_valid = len(dataset) - n_train
         trainset, validset = random_split(dataset,[n_train, n_valid],generator=torch.Generator().manual_seed(0))
-        train_loader = DataLoader(trainset,shuffle = True, **arg_loader)
+        train_loader = DataLoader(trainset,shuffle = False, **arg_loader)
         valid_loader = DataLoader(validset,shuffle = False, **arg_loader)
     else:
         n_train = len(dataset)
@@ -137,25 +123,19 @@ def training(net,
     for i in range(1, epoch+1):
         net.train()
         epoch_loss = 0
-        train_iou = 0
         for imgs, truthes in tqdm(train_loader):
-            imgs = imgs.to(torch.float32)
-            imgs = imgs.to(device)
-            truthes = truthes.to(device = device)
-            predict_mask = net(imgs) #Size([B, 1, 512, 512]
-
-            train_result = (torch.sigmoid(predict_mask) > 0.5).to(torch.int64)
-            train_iou += iou(train_result,truthes.to(torch.int64))
-
-            loss = loss_fn(predict_mask, truthes)
+            imgs = imgs.to(dtype=torch.float32,device=device)
+            truthes = truthes.squeeze(1).to(dtype=torch.float32,device = device)
+            # print(imgs.shape, truthes.shape)
+            logits = net(imgs) #Size([B, 1, 512, 512]
+            # print(logits.shape, truthes.shape)
+            loss = loss_fn(logits, truthes.long())
             epoch_loss += loss.item()
-
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
         logging.info(f'Training loss: {epoch_loss:6.4f} at epoch {i}.')
-
         #validation
         if is_valid:
             net.eval()           
@@ -166,18 +146,8 @@ def training(net,
                 with torch.no_grad():
                     logits = net(val_imgs)
                     #print(mask_pred.cpu())
-                    mask_pred = (torch.sigmoid(logits) > 0.5).to(torch.int64) # (batch, channel,h ,w)
-                    if save_picture:
-                        if i % 10 == 0:
-                            #看一下mask_pred的圖
-                            # cv2.imshow('"mask_pred"',mask_pred[0].permute(1,2,0).cpu().numpy()) #取驗證集的第一張圖片預測之mask看效果
-                            # cv2.waitKey(0) # wait for ay key to exit window
-                            mask = mask_pred.cpu().detach()
-                            mask *= 255 #把圖片像素轉回255
-                            cv2.imwrite(os.path.join(dir_predict,f'epoch{i}.png'),mask[0].permute(1,2,0).cpu().numpy())
-                            #logging.info(f"epoch{i}.png had written.")
-                    #compute the IOU           
-            #         miou_score = iou(mask_pred,val_truthes)
+                    mask_pred = torch.argmax(torch.softmax(logits,dim=1),dim=1).to(torch.int64) # (batch, channel,h ,w)
+                    #compute the IOU          
                     miou_score = compute_mIoU(mask_pred.cpu().numpy(),val_truthes.cpu().numpy()) #新增
                     miou_list.append(miou_score)
         
